@@ -1,0 +1,269 @@
+pragma language_version >= 0.23;
+
+import CompactStandardLibrary;
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Simple Flash Loan Pool — an educational atomic flash-loan lifecycle model
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  WHAT THIS IS
+//  A single-contract model of a flash loan: one atomic circuit call runs the
+//  whole lifecycle — request → validate → borrow → arbitrage evaluation →
+//  repayment check → settle — and either completes as one transaction or
+//  reverts entirely. This is NOT a production flash loan: Midnight has no
+//  DEX contracts to arbitrage against and Compact 0.23 does not implement
+//  cross-contract calls, so the "market" here is a private price witness and
+//  the liquidity pool is a virtual public balance (no real token custody).
+//  See README.md "Limitations" for the exact gap.
+//
+//  PUBLIC vs PRIVATE INFORMATION MAP
+//  ────────────────────────────────────
+//  PUBLIC (any observer can read):
+//    adminKeyHash      : SHA-256 hash of the deployer's coin public key.
+//                        Binding the admin to a HASH proves identity without
+//                        exposing the key itself.
+//    poolLiquidity     : virtual pool balance, base units. Public by
+//                        necessity — liquidity is a shared, visible resource.
+//    protocolFeeBps    : protocol fee rate (parts per 10,000; max 1,000).
+//                        Public so borrowers can compute fees in advance.
+//    minLoan / maxLoan : loan bounds. Public so borrowers can pre-check.
+//    paused            : pool state (open / halted). Public operational state.
+//    runCounter        : number of completed runs. Public audit counter.
+//    totalFeeCollected : lifetime fees captured. Public balance-sheet total.
+//    runs              : newest-first history of COMPLETED runs. Each record
+//                        carries { runId (caller label), requester (hash of
+//                        the borrower's coin public key — pseudonymous),
+//                        amount, fee }.
+//
+//  PRIVATE (known only to the prover's machine; never disclosed, never
+//  stored, never returned — enforced by the compiler's disclosure analysis):
+//    arbitragePrices   : the bid/ask price pair the borrower "observed".
+//                        The circuit proves the arbitrage is profitable using
+//                        these values but stores only their consequences:
+//                        amount, fee, and the fact that settlement succeeded.
+//    borrower's profit : proceeds − (amount + fee). Derived only inside the
+//                        circuit, used only in >= comparison, never exposed.
+//                        An observer learns "a profitable arbitrage occurred
+//                        and the fee was captured" — never the prices, the
+//                        gross proceeds, or the borrower's net profit.
+//
+//  WHAT AN OBSERVER CAN AND CANNOT LEARN
+//    CAN learn : pool state, loan params, every completed loan's size, fee
+//                and pseudonymous requester, fee rates, protocol totals.
+//    CANNOT   : the prices at which any particular arbitrage happened, the
+//               borrower's profit, or the admin's actual public key.
+//
+//  WHY THIS SHAPE
+//  On real flash-loan rails the borrowed funds physically leave the pool
+//  inside the transaction; here the round trip is internal because there is
+//  no external market. Every require() below is a failure path that reverts
+//  the whole transaction — failing runs never appear on the ledger, exactly
+//  as with a production flash loan. Verify everything a future version
+//  removes: each invariant maps to real financial exposure.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+//  SCALING CONSTANTS (see README "How it works" — all arithmetic is
+//  division-free by design; Compact 0.23 has only + − *).
+//    amounts  : base units (1 token = 1_000_000 base units)
+//    AMOUNT_MAX       = 1_000_000_000  (max borrow per run)
+//    LIQUIDITY_CAP    = 1_000_000_000_000 (pool ceiling)
+//    PRICE_MAX        = 1_000_000_000  (max bid/ask quote)
+//    FEE_BPS_MAX      = 1_000          (10.00%)
+//    Every product appearing below stays < 2^63 on the enforced ranges.
+// ═══════════════════════════════════════════════════════════════════════════
+
+export struct ArbitragePrices {
+  bid: Uint<64>;
+  ask: Uint<64>;
+}
+
+export struct RunRecord {
+  runId: Opaque<"string">;
+  requester: Bytes<32>;
+  amount: Uint<64>;
+  fee: Uint<64>;
+}
+
+// ─── Public ledger state ────────────────────────────────────────────────────
+
+// Hash of the deployer's coin public key. `sealed`: writable only by the
+// constructor, so admin identity can never be rotated on-chain. Public —
+// it binds the admin without revealing the key (zero-knowledge by hashing).
+export sealed ledger adminKeyHash: Bytes<32>;
+
+// Virtual pool liquidity in base units. Public: borrowers must be able to
+// see how much they could borrow and lenders how much is at stake.
+export ledger poolLiquidity: Uint<64>;
+
+// Protocol fee in basis points (per 10,000). Public parameter.
+export ledger protocolFeeBps: Uint<16>;
+
+// Minimum and maximum loan sizes. Public parameters.
+export ledger minLoan: Uint<64>;
+export ledger maxLoan: Uint<64>;
+
+// Pool halted flag. Public operational state.
+export ledger paused: Boolean;
+
+// Total completed runs. Public audit counter.
+export ledger runCounter: Uint<64>;
+
+// Lifetime captured fees. Public balance-sheet total.
+export ledger totalFeeCollected: Uint<64>;
+
+// History of completed runs, newest first. Public: settlement outcomes are
+// observable by design; identities inside are pseudonymous hashes.
+export ledger runs: List<RunRecord>;
+
+// ─── Private witness ────────────────────────────────────────────────────────
+
+module FlashLoanWitnesses {
+  // The bid/ask pair the borrower observed in the market. This is the
+  // meaningful private input of the contract: it feeds the profitability
+  // proof without ever leaving the prover's machine. The circuit only uses
+  // it inside comparisons; the compiler forbids storing or returning it.
+  export witness arbitragePrices(): ArbitragePrices;
+}
+import { arbitragePrices } from FlashLoanWitnesses;
+
+// ─── Shared helper ──────────────────────────────────────────────────────────
+
+// Proves the transaction creator is the contract admin: the hash of their
+// coin public key must equal the value sealed at construction. The key is
+// never revealed; the tx must be signed with the matching secret key for
+// the transaction to be valid at all, so this is a real access control
+// check, not a convention. Failure path: UNAUTHORIZED ACTION.
+circuit requireAdmin(): [] {
+  assert(persistentHash<ZswapCoinPublicKey>(ownPublicKey()) == adminKeyHash, "unauthorized: not admin");
+}
+
+// ─── Main circuit: the atomic flash-loan lifecycle ──────────────────────────
+
+// One call = one loan run = one atomic transaction.
+//
+// Internal stage sequence (mirrored by the frontend proof dial):
+//   1 REQUEST   — caller identifies amount (public arg) + runId (public label)
+//   2 VALIDATE  — pool open, amount within [minLoan, maxLoan], liquidity
+//   3 BORROW    — pool liquidity is committed to cover the amount
+//   4 ARBITRAGE — profitable price pair witnessed: ask > bid within bounds
+//   5 REPAY     — proceeds provably cover principal + fee (cross-multiplied,
+//                 division-free: floor(A·ask/bid) >= amount+fee  ⇔
+//                 A·ask >= (amount+fee)·bid)
+//   6 SETTLE    — ledger records fee capture, counters and the run record
+//
+// Failure paths (each reverts the whole transaction — atomic semantics):
+//   amount < minLoan / amount > maxLoan / amount > poolLiquidity
+//   fee != floor(amount·protocolFeeBps/10000)   (sandwich: fee·1e4 ≤ A·B <
+//                                                (fee+1)·1e4 — the caller
+//                                                supplies fee, the circuit
+//                                                proves it exact without
+//                                                division)
+//   ask <= bid  /  out-of-bounds prices  /  proceeds cannot cover repayment
+//   liquidity cap would be exceeded
+//
+// What the circuit CHANGES: poolLiquidity += fee (net pool growth after the
+// internal round trip), totalFeeCollected += fee, runCounter += 1, one
+// RunRecord pushed. The borrower's profit is computed inside the circuit,
+// proven non-negative, and never stored or returned.
+export circuit executeFlashLoan(amount: Uint<64>, fee: Uint<64>, runId: Opaque<"string">): [] {
+  const prices = arbitragePrices();
+
+  // STAGE 2 — VALIDATE
+  assert(!paused, "pool is paused");
+  assert(amount >= minLoan, "amount below minimum");
+  assert(amount <= maxLoan, "amount above maximum");
+  assert(amount <= poolLiquidity, "insufficient liquidity");
+
+  // REPAYMENT AMOUNT — exact protocol fee, proven without division:
+  //   fee·10_000 ≤ amount·feeBps < (fee+1)·10_000  ⇔  fee = ⌊amount·feeBps/10_000⌋
+  assert(fee <= amount, "fee exceeds principal");
+  assert(fee * 10000 <= amount * protocolFeeBps, "fee above protocol rate");
+  assert((fee + 1) * 10000 > amount * protocolFeeBps, "fee below protocol rate");
+
+  // STAGE 4 — ARBITRAGE EVALUATION (private witness stays private)
+  assert(prices.ask > prices.bid, "unprofitable arbitrage: ask not above bid");
+  assert(prices.bid >= 1, "bid price out of bounds");
+  assert(prices.ask <= 1000000000, "ask price out of bounds");
+
+  // STAGE 5 — REPAYMENT CHECK (cross-multiplication, no division/rounding)
+  assert(amount * prices.ask >= (amount + fee) * prices.bid, "arbitrage does not cover repayment");
+  assert(poolLiquidity + fee <= 1000000000000, "liquidity cap reached");
+
+  // STAGE 6 — SETTLE
+  poolLiquidity = disclose(poolLiquidity + fee) as Uint<64>;
+  totalFeeCollected = disclose(totalFeeCollected + fee) as Uint<64>;
+  runCounter = disclose(runCounter + 1) as Uint<64>;
+  runs.pushFront(RunRecord{
+    runId: disclose(runId),
+    requester: persistentHash<ZswapCoinPublicKey>(ownPublicKey()),
+    amount: disclose(amount),
+    fee: disclose(fee),
+  });
+}
+
+// ─── Admin circuits ─────────────────────────────────────────────────────────
+
+// Increase virtual pool liquidity. Failure paths: not admin, amount out of
+// bounds, cap reached. The liquidity is VIRTUAL (no tokens move on the
+// ledger); depositing here only raises the public number the pool can lend.
+export circuit topUpLiquidity(amount: Uint<64>): [] {
+  requireAdmin();
+  assert(amount >= 1, "invalid top-up amount");
+  assert(amount <= 1000000000000, "top-up above liquidity cap");
+  assert(poolLiquidity + amount <= 1000000000000, "liquidity cap reached");
+  poolLiquidity = disclose(poolLiquidity + amount) as Uint<64>;
+}
+
+// Decrease virtual pool liquidity (admin withdrawal). Failure paths: not
+// admin, amount out of bounds, withdrawing more than the pool holds.
+export circuit withdrawLiquidity(amount: Uint<64>): [] {
+  requireAdmin();
+  assert(amount >= 1, "invalid withdrawal amount");
+  assert(amount <= poolLiquidity, "insufficient liquidity");
+  poolLiquidity = disclose(poolLiquidity - amount) as Uint<64>;
+}
+
+// Change the protocol fee. Failure path: not admin, rate > 1000 bps (10%).
+export circuit setFeeBps(bps: Uint<16>): [] {
+  requireAdmin();
+  assert(bps <= 1000, "fee must be at most 1000 bps");
+  protocolFeeBps = disclose(bps);
+}
+
+// Change loan bounds. Failure path: not admin, inconsistent bounds
+// (min > max, zeros, out-of-range values).
+export circuit setLoanLimits(min: Uint<64>, max: Uint<64>): [] {
+  requireAdmin();
+  assert(min >= 1 && min <= 1000000000, "invalid minimum loan");
+  assert(max <= 1000000000, "invalid maximum loan");
+  assert(min <= max, "min must not exceed max");
+  minLoan = disclose(min);
+  maxLoan = disclose(max);
+}
+
+// Halt or resume the pool. Failure path: not admin.
+export circuit setPaused(to: Boolean): [] {
+  requireAdmin();
+  paused = disclose(to);
+}
+
+// ─── Constructor ────────────────────────────────────────────────────────────
+
+// Deploys the pool with an initial virtual liquidity, fee rate and loan
+// bounds, and seals the deployer's key as the admin. All arguments are
+// public (they appear in the deploy transaction) and stored with explicit
+// disclosure; the deployer's key itself is never stored — only its hash.
+constructor(initialLiquidity: Uint<64>, feeBps: Uint<16>, min: Uint<64>, max: Uint<64>) {
+  assert(initialLiquidity >= 1 && initialLiquidity <= 1000000000000, "invalid initial liquidity");
+  assert(feeBps <= 1000, "invalid fee bps");
+  assert(min >= 1 && min <= 1000000000, "invalid minimum loan");
+  assert(max <= 1000000000 && min <= max, "invalid maximum loan");
+  adminKeyHash = persistentHash<ZswapCoinPublicKey>(ownPublicKey());
+  poolLiquidity = disclose(initialLiquidity);
+  protocolFeeBps = disclose(feeBps);
+  minLoan = disclose(min);
+  maxLoan = disclose(max);
+  paused = false;
+  runCounter = 0;
+  totalFeeCollected = 0;
+}
