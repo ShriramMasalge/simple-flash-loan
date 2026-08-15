@@ -93,6 +93,7 @@ export async function compileContract(): Promise<CompiledFlashLoanContract> {
           // so the first element is undefined.
           arbitragePrices: () => {
             const p = getPrices();
+            console.log('[witness] arbitragePrices:', { bid: p.bid.toString(), ask: p.ask.toString() });
             return [undefined, { bid: p.bid, ask: p.ask }];
           },
         }),

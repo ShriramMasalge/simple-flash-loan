@@ -59,3 +59,6 @@ temp/
 
 # Frontend build output
 frontend/dist/
+
+# Generated contract module synced into the frontend source tree by `npm run sync:zk`
+frontend/src/zk-contract/
