@@ -57,6 +57,9 @@ midnight-level-db/
 tmp/
 temp/
 
+# Development scripts
+scripts/
+
 # Frontend build output
 frontend/dist/
 

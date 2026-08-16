@@ -111,7 +111,6 @@ export function BorrowPanel({
         zkBaseURL,
         networkId: wallet.networkId ?? 'undeployed',
         arbitragePrices: () => {
-          console.log('arbitragePrices witness:', { bid: String(snapshotBid), ask: String(snapshotAsk), bidType: typeof snapshotBid, askType: typeof snapshotAsk });
           return { bid: snapshotBid, ask: snapshotAsk };
         },
       });
@@ -119,15 +118,29 @@ export function BorrowPanel({
       setOutcome('Building the run transaction — proving via the wallet…');
       await pause(150);
       setCurrentStage(4);
-      await clientRef.current.executeFlashLoan(amount, fee, id);
+      const EXECUTION_TIMEOUT_MS = 90_000;
+      const WARNING_AFTER_MS = 15_000;
+      const executionPromise = clientRef.current!.executeFlashLoan(amount, fee, id);
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Wallet disconnected or execution timed out — please ensure the wallet extension is still connected and retry.')), EXECUTION_TIMEOUT_MS);
+      });
+      const warningTimer = setTimeout(() => {
+        setOutcome('Still waiting on the wallet… keep the Lace extension open and respond to any popup.');
+      }, WARNING_AFTER_MS);
+      try {
+        await Promise.race([executionPromise, timeoutPromise]);
+      } finally {
+        clearTimeout(warningTimer);
+      }
       setCurrentStage(6);
       setRunId(id);
       setOutcome('Run settled on-chain — fee captured, run recorded.');
       setPhase('settled');
-    } catch (err: any) {
-      setPhase('rejected');
-      setOutcome(`Execution rejected: ${err?.message ?? String(err)}`);
-    } finally {
+} catch (err: any) {
+  console.error('executeFlashLoan failed:', err);
+  setPhase('rejected');
+  setOutcome(`Execution rejected: ${err?.message ?? String(err)}`);
+} finally {
       clearInterval(timer);
     }
   };

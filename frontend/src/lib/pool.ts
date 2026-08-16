@@ -6,6 +6,8 @@
  * the same decoding path the e2e suite uses.
  */
 
+import { ContractState } from '@midnight-ntwrk/compact-runtime';
+
 export interface RunRecordView {
   runId: string;
   requester: Uint8Array;
@@ -37,13 +39,22 @@ async function ledgerGetter(): Promise<(state: unknown) => any> {
 
 /** Reads + decodes the latest on-chain pool state from the indexer. */
 export async function readLedger(indexerUrl: string, contractAddress: string): Promise<PoolLedgerView> {
-  const { indexerPublicDataProvider } = await import('@midnight-ntwrk/midnight-js-indexer-public-data-provider');
-  const pdp = indexerPublicDataProvider(indexerUrl, indexerUrl.replace(/^http/, 'ws'));
-  const onChain: any = await pdp.queryContractState(contractAddress);
-  if (!onChain) throw new Error('No contract state returned by the indexer.');
+  const res = await fetch(indexerUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      query: `query { contractAction(address: "${contractAddress}") { state } }`,
+    }),
+  });
+  const json = await res.json();
+  const stateHex = json?.data?.contractAction?.state;
+  if (!stateHex) throw new Error('No contract state returned by the indexer.');
+
+  const stateBytes = new Uint8Array(Buffer.from(stateHex, 'hex'));
+  const onChain: any = ContractState.deserialize(stateBytes);
   const charged: unknown = onChain.data ?? onChain.state;
-  const ledger = await ledgerGetter();
-  const view = ledger(charged);
+  const ledgerFn = await ledgerGetter();
+  const view = ledgerFn(charged);
   const runs: RunRecordView[] = [];
   for (const r of view.runs) runs.push(r);
   return {

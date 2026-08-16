@@ -1,13 +1,13 @@
 import { useEffect, useState } from 'react';
 import { resolveEndpoints } from './lib/config';
 import { readLedger, type PoolLedgerView } from './lib/pool';
-import { connectWallet, disconnectWallet, detectWallet, type WalletState } from './lib/wallet';
+import { connectWallet, disconnectWallet, detectWallet, listWallets, type WalletState, type WalletApi } from './lib/wallet';
 import { PoolView } from './components/PoolView';
 import { BorrowPanel } from './components/BorrowPanel';
 import { AdminPanel } from './components/AdminPanel';
 import { setNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
 
-setNetworkId('undeployed');
+setNetworkId('preview');
 
 const CONTRACT_ADDRESS = (import.meta as any).env?.VITE_CONTRACT_ADDRESS as string | undefined;
 
@@ -48,6 +48,7 @@ export function App() {
           setPoolError(null);
         }
       } catch (err: any) {
+        console.error(err);
         if (!cancelled) setPoolError(err?.message ?? String(err));
       }
     };
@@ -59,10 +60,28 @@ export function App() {
     };
   }, [indexer]);
 
-  const onConnect = async () => {
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [availableWallets, setAvailableWallets] = useState<WalletApi[]>([]);
+
+  const onConnect = async (chosen: WalletApi) => {
+    setPickerOpen(false);
     setWallet((w) => ({ ...w, status: 'connecting', error: null }));
-    const next = await connectWallet('undeployed');
+    const next = await connectWallet('preview', chosen);
     setWallet(next);
+  };
+
+  const onConnectClick = () => {
+    const wallets = listWallets();
+    if (wallets.length === 0) {
+      setWallet((w) => ({ ...w, status: 'unsupported', error: 'No Midnight wallet extension detected.' }));
+      return;
+    }
+    if (wallets.length === 1) {
+      void onConnect(wallets[0]);
+      return;
+    }
+    setAvailableWallets(wallets);
+    setPickerOpen(true);
   };
 
   const onDisconnect = async () => {
@@ -100,14 +119,34 @@ export function App() {
               Connecting…
             </button>
           ) : (
-            <button
-              onClick={onConnect}
-              disabled={wallet.status === 'unsupported'}
-              title={wallet.status === 'unsupported' ? 'No Midnight wallet extension detected' : undefined}
-              style={{ padding: '6px 12px', borderRadius: 6, cursor: wallet.status === 'unsupported' ? 'not-allowed' : 'pointer' }}
-            >
-              {wallet.status === 'unsupported' ? 'Wallet: not detected' : 'Connect wallet'}
-            </button>
+            <div style={{ position: 'relative' }}>
+              <button
+                onClick={onConnectClick}
+                disabled={wallet.status === 'unsupported'}
+                title={wallet.status === 'unsupported' ? 'No Midnight wallet extension detected' : undefined}
+                style={{ padding: '6px 12px', borderRadius: 6, cursor: wallet.status === 'unsupported' ? 'not-allowed' : 'pointer' }}
+              >
+                {wallet.status === 'unsupported' ? 'Wallet: not detected' : 'Connect wallet'}
+              </button>
+              {pickerOpen && (
+                <div
+                  style={{
+                    position: 'absolute', top: '110%', right: 0, background: '#1a1a2e',
+                    border: '1px solid #444', borderRadius: 8, padding: 6, zIndex: 10, minWidth: 160,
+                  }}
+                >
+                  {availableWallets.map((w, i) => (
+                    <button
+                      key={i}
+                      onClick={() => void onConnect(w)}
+                      style={{ display: 'block', width: '100%', textAlign: 'left', padding: '6px 10px', borderRadius: 6, cursor: 'pointer', background: 'transparent', border: 'none', color: 'inherit' }}
+                    >
+                      {w.name ?? `Wallet ${i + 1}`}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           )}
         </div>
       </header>
@@ -146,7 +185,7 @@ export function App() {
       {tab === 'borrow' && (
         <BorrowPanel pool={pool} wallet={wallet} proofServer={proofServer} zkBaseURL={zkBaseURL} indexer={indexer} indexerWS={indexerWS} />
       )}
-      {tab === 'admin' && <AdminPanel pool={pool} wallet={wallet} />}
+      {tab === 'admin' && <AdminPanel pool={pool} wallet={wallet} indexer={indexer} indexerWS={indexerWS} zkBaseURL={zkBaseURL} />}
     </div>
   );
 }

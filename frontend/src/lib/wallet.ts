@@ -27,7 +27,7 @@ declare global {
   }
 }
 
-interface WalletApi {
+export interface WalletApi {
   name?: string;
   rdns?: string;
   apiVersion?: string;
@@ -63,7 +63,7 @@ export async function detectWallet(timeoutMs = 2000): Promise<boolean> {
   return false;
 }
 
-export async function connectWallet(networkId: string): Promise<WalletState> {
+export async function connectWallet(networkId: string, chosenWallet?: WalletApi): Promise<WalletState> {
   const wallets = listWallets();
   if (wallets.length === 0) {
     return {
@@ -74,7 +74,7 @@ export async function connectWallet(networkId: string): Promise<WalletState> {
       api: null,
     };
   }
-  const wallet = wallets[0];
+  const wallet = chosenWallet ?? wallets[0];
   try {
     const api = await wallet.connect(networkId);
     const [status, shielded] = await Promise.all([
@@ -93,7 +93,7 @@ export async function connectWallet(networkId: string): Promise<WalletState> {
       status: 'error',
       networkId: null,
       address: null,
-      error: `${err?.message ?? String(err)} (network: ${networkId})`,
+      error: `${err?.message ?? String(err)} — this app requires the "Preview" network. Switch to Preview in the Lace extension, then reconnect. (app requested: ${networkId})`,
       api: null,
     };
   }
