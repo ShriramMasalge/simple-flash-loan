@@ -93,7 +93,7 @@ export async function connectWallet(networkId: string, chosenWallet?: WalletApi)
       status: 'error',
       networkId: null,
       address: null,
-      error: `${err?.message ?? String(err)} — this app requires the "Preview" network. Switch to Preview in the Lace extension, then reconnect. (app requested: ${networkId})`,
+      error: `${err?.message ?? String(err)} — this app requires the "${networkId}" network. Switch to ${networkId} in the Lace extension, then reconnect.`,
       api: null,
     };
   }
